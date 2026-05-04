@@ -1,0 +1,333 @@
+---
+title: "EDLD 653 Midterm"
+author: "James Phillips"
+format: html
+embed-resources: true
+cache: true
+highlight-style: breeze
+editor: visual
+---
+
+```{r}
+#| label: load-packages
+#| include: false
+
+library(glue)
+library(tidyverse)
+library(rio)
+library(here)
+library(janitor)
+library(gapr)
+```
+
+## Part A: Data
+
+1.  Use the function provided to download **all** of the data from the 2014-2015 to 2017-2018 school years and bind it into a single data frame, **using a single function**.
+
+```{r}
+#| label: function-creator
+
+download_file <- function(year) {
+  link <- glue::glue("https://www.oregon.gov/ode/educator-resources/assessment/TestResults20{year}/pagr_schools_ela_raceethnicity_{year-1}{year}.xlsx")
+  rio::import(link, setclass = "tibble", na = c("-", "--", "*"))
+}
+
+school_years_data <- map_dfr(15:18, download_file)
+```
+
+Conduct some basic data cleaning. Filter for only student groups coded as "White" or "Hispanic/Latino." Select variables related to the number of students in each of the levels (1 through 4), and **not** percentages or combined levels. Remove any row that has missing data in any of the *n* variables.
+
+```{r}
+#| label: data-cleaning
+
+school_years_data <- clean_names(school_years_data)
+
+cleaned_schoolyearsdata <- school_years_data |> 
+  filter(student_group %in% c("White", "Hispanic/Latino")) |> 
+  select(
+    academic_year,
+    district,
+    school,
+    student_group,
+    grade_level,
+    number_level_1,
+    number_level_2,
+    number_level_3,
+    number_level_4) |>
+  drop_na(number_level_1, number_level_2, number_level_3, number_level_4)
+
+cleaned_schoolyearsdata <- cleaned_schoolyearsdata |>
+  pivot_longer(
+    cols = starts_with("number_level"),
+    names_to = "level",
+    values_to = "n"
+  )
+
+cleaned_schoolyearsdata <- cleaned_schoolyearsdata |> 
+  mutate(
+    level = str_extract(level, "\\d+")
+  )
+
+# Note: I know I can put these all together, but I kept running into issues when it was one continuous line being piped, so I had to break it down a bit.
+```
+
+2. Sum the *n* across grades and school for each district within each academic year, student group, and level. Calculate the number of schools for each district. Also move your data to a wider format where the student groups become new columns, filled by the district n. Remove districts that did not report numbers for one or both student groups.
+
+```{r}
+#| label: data-sums
+
+districts_grades_breakdown <- cleaned_schoolyearsdata |> 
+  group_by(district) |> 
+  summarise(
+    n_schools = n_distinct(school),
+    .groups = "drop"
+  ) |> 
+  left_join(
+    cleaned_schoolyearsdata |> 
+      group_by(academic_year, district, student_group, level) |> 
+      summarise(
+        district_n = sum(n, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = "district"
+  ) |> 
+  pivot_wider(
+    names_from = student_group,
+    values_from = district_n
+  )
+
+districts_grades_breakdown <- districts_grades_breakdown |> 
+  drop_na("Hispanic/Latino", "White") |> 
+  rename(
+    hispanic_latino = "Hispanic/Latino",
+    white = "White"
+  )
+
+districts_grades_breakdown <- districts_grades_breakdown |> 
+  select(
+    academic_year,
+    district,
+    n_schools,
+    level,
+    hispanic_latino,
+    white
+  )
+```
+
+## Part B: Achievement Disparities
+
+1. Estimate the average achievement differences in terms of an effect size for every school district in the state that reported data on both student groups for each academic year. Conduct this analysis twice, once by using group_by() |> nest() and map(), and once by using nest_by() |>  summarize().
+
+```{r}
+#| label: diff-est-1
+#| warning: false
+#| message: false
+
+difference_estimates_1 <- districts_grades_breakdown |> 
+  group_by(academic_year, district) |> 
+  nest() |> 
+  mutate(
+    v = map(
+      data,
+      ~ gapr::estimate_v(.x, "white", "hispanic_latino")
+    )
+  ) |> 
+  unnest(v) |> 
+  ungroup()
+```
+
+```{r}
+#| label: diff-est-2
+#| warning: false
+#| message: false
+
+difference_estimates_2 <- districts_grades_breakdown |> 
+  nest_by(academic_year, district) |> 
+  summarise(
+    estimate_v(data, "white", "hispanic_latino"),
+    .groups = "drop"
+  )
+```
+
+2. Reproduce the provided plot to confirm the estimates are equivalent across methods.
+
+```{r}
+#| label: compare-data
+
+plot_compare <- difference_estimates_1 |> 
+  select(academic_year, district, v_1 = v) |> 
+  inner_join(
+    difference_estimates_2 |> 
+      select(academic_year, district, v_2 = v),
+    by = c("academic_year", "district")
+  )
+
+plot_compare |> 
+  ggplot(aes(x = v_2, y = v_1)) +
+  geom_point(alpha = 0.6, color = "grey40") +
+  geom_abline(slope = 1, intercept = 0, color = "lightblue", linewidth = 1) +
+  labs(
+    x = "V (`nest_by() |> summarize()`)",
+    y = "V (`group_by() |>  nest() |>  mutate() |>  map()`)"
+  ) +
+  theme_minimal()
+```
+
+3. The plot provided shows the achievement difference estimates for one school district across years. Produce a similar plot to the one provided for each of the first 100 school districts. Once you've created all the plots, **reproduce them again using an alternative method**. Make sure you don't miss the caption noting the number of schools in the district.
+
+```{r}
+#| label: plot-dists-hint
+
+v <- difference_estimates_1 |> 
+  left_join(
+    districts_grades_breakdown |> 
+      distinct(academic_year, district, n_schools),
+    by = c("academic_year", "district")
+  )
+
+dists <- unique(v$district)[1:100]
+```
+
+```{r}
+#| label: plot-method-1
+
+plots_m1 <- v |> 
+  filter(district %in% dists) |> 
+  group_by(district) |> 
+  group_split() |> 
+  map(function(df) {
+    dist_name <- unique(df$district)
+    n_schools <- unique(df$n_schools)
+    
+    df <- df |> 
+      mutate(
+        sign = dplyr::case_when(
+          v > 0 ~ "Hispanic/Latino higher",
+          v < 0 ~ "White higher",
+          TRUE ~ "No difference"
+        )
+      )
+    
+    ggplot(df, aes(x = academic_year, y = v, group = 1)) +
+      geom_hline(yintercept = 0, color = "red") +
+      geom_linerange(aes(ymin = v - 1.96 * v_se,
+                         ymax = v + 1.96 * v_se),
+                     color = "grey40", linewidth = 0.7) +
+      geom_line(color = "grey80", linetype = "dashed") +
+      geom_point(aes(color = sign), size = 3) +
+      scale_color_manual(
+        values = c(
+          "Hispanic/Latino higher" = "lightblue",
+          "White higher" = "purple",
+          "No difference" = "grey20"
+        ),
+        guide = "none"
+      ) +
+      labs(
+        title = str_glue("Achievement Gap Estimates: {dist_name}"),
+        subtitle = "Negative values indicate White students have higher average achievement\nPositive values indicate Hispanic/Latino students have higher average achievemenbt",
+        x = "School Year",
+        y = "Average Achievement Difference (SD units)",
+        caption = str_glue("District included {n_schools} schools.")
+      ) +
+      theme_minimal(base_size = 12)
+  })
+```
+
+```{r}
+#| label: plot-method-2
+#| warning: false
+#| message: false
+
+plots_m2 <- v |> 
+  filter(district %in% dists) |> 
+  nest_by(district) |> 
+  mutate(
+    plot = list({
+      df <- data
+      dist_name <- unique(df$district)
+      n_schools <- unique(df$n_schools)
+      
+      df <- df |> 
+        mutate(
+          sign = dplyr::case_when(
+            v > 0 ~ "Hispanic/Latino higher",
+            v < 0 ~ "White higher",
+            TRUE ~ "No difference"
+          )
+        )
+      
+      ggplot(df, aes(x = academic_year, y = v, group = 1)) +
+      geom_hline(yintercept = 0, color = "red") +
+      geom_linerange(aes(ymin = v - 1.96 * v_se,
+                         ymax = v + 1.96 * v_se),
+                     color = "grey40", linewidth = 0.7) +
+      geom_line(color = "grey80", linetype = "dashed") +
+      geom_point(aes(color = sign), size = 3) +
+      scale_color_manual(
+        values = c(
+          "Hispanic/Latino higher" = "lightblue",
+          "White higher" = "purple",
+          "No difference" = "grey20"
+        ),
+        guide = "none"
+      ) +
+      labs(
+        title = str_glue("Achievement Gap Estimates: {dist_name}"),
+        subtitle = "Negative values indicate White students have higher average achievement\nPositive values indicate Hispanic/Latino students have higher average achievemenbt",
+        x = "School Year",
+        y = "Average Achievement Difference (SD units)",
+        caption = str_glue("District included {n_schools} schools.")
+      ) +
+      theme_minimal(base_size = 12)
+    })
+  ) |> 
+  ungroup()
+
+```
+
+4. Save the plots into a "plots" directory. Make sure the file names are meaningful.
+
+```{r}
+#| label: plot-save
+#| warning: false
+#| message: false
+
+dist_names <- v |> 
+  filter(district %in% dists) |> 
+  distinct(district) |> 
+  arrange(district) |> 
+  pull(district)
+
+walk2(
+  .x = plots_m1,
+  .y = dist_names,
+  ~ ggsave(
+    filename = glue("plots/m1_achievement_gap_{str_replace_all(.y, '\\\\s+',
+                    '_')}.png"),
+    plot = .x,
+    width = 6,
+    height = 6,
+    dpi = 300
+  )
+)
+
+plots_m2 <- plots_m2 |> 
+  mutate(
+    file = glue(
+      "plots/m2_achievement_gap_{str_replace_all(district, '\\\\s+', '_')}.png"
+    )
+  )
+
+walk2(
+  .x = plots_m2$plot,
+  .y = plots_m2$file,
+  ~ ggsave(
+    filename = .y,
+    plot = .x,
+    width = 6,
+    height = 6,
+    dpi = 300
+  )
+)
+```
